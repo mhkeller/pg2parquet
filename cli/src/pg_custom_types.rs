@@ -332,3 +332,45 @@ impl<TRow: PgAbstractRow> PgAbstractRow for UnclonableHack<TRow> {
         self.0.ab_len()
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct PgVector {
+		pub dimensions: usize,
+		pub data: Vec<f32>
+}
+
+// cli/src/pg_custom_types.rs
+impl<'a> FromSql<'a> for PgVector {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        debug_assert_eq!(ty.name(), "vector");
+
+        // Parse the dimension value (first 4 bytes)
+        if raw.len() < 8 {
+            return Ok(PgVector { dimensions: 0, data: Vec::new() });
+        }
+
+        let dimension = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+
+        // Skip 8 bytes of header
+        let data_start = 8;
+        let mut data = Vec::with_capacity(dimension);
+
+        for i in 0..dimension {
+            if data_start + (i+1)*4 > raw.len() {
+                break;
+            }
+
+            let start = data_start + i*4;
+            let value = f32::from_le_bytes([
+                raw[start], raw[start+1], raw[start+2], raw[start+3]
+            ]);
+            data.push(value);
+        }
+
+        Ok(PgVector { dimensions: dimension, data })
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        ty.name() == "vector"
+    }
+}

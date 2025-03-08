@@ -28,6 +28,7 @@ use crate::appenders::{new_autoconv_generic_appender, new_static_merged_appender
 use crate::datatypes::interval::PgInterval;
 use crate::datatypes::jsonb::PgRawJsonb;
 use crate::datatypes::money::PgMoney;
+use crate::pg_custom_types::PgVector;
 use crate::datatypes::numeric::{new_decimal_bytes_appender, new_decimal_int_appender};
 use crate::myfrom::{MyFrom, self};
 use crate::parquet_writer::{WriterStats, ParquetRowWriter, WriterSettings};
@@ -136,7 +137,7 @@ fn build_tls_connector(certificates: &Option<Vec<PathBuf>>) -> Result<postgres_n
 		if let Ok(der) = native_tls::Certificate::from_der(&bytes) {
 			return Ok(der);
 		}
-		
+
 		Err(format!("Failed to load certificate from file {:?}", f))
 	}
 	let mut builder = native_tls::TlsConnector::builder();
@@ -374,7 +375,7 @@ fn map_schema_column<TRow: PgAbstractRow + Clone + 'static>(
 			let element_column = list_column.nest("element", 0);
 
 			let (element_appender, element_schema) = map_schema_column(element_type, &element_column, settings)?;
-			
+
 			debug_assert_eq!(element_schema.name(), "element");
 
 			let plain_schema = settings.array_handling == SchemaSettingsArrayHandling::Plain;
@@ -550,6 +551,21 @@ fn map_simple_type<TRow: PgAbstractRow + Clone + 'static>(
 		"bit" | "varbit" =>
 			resolve_primitive::<bit_vec::BitVec, ByteArrayType, _>(name, c, Some(LogicalType::String), None),
 
+		"vector" => {
+			let appender = ArrayColumnAppender::new(
+					new_autoconv_generic_appender::<f32, FloatType>(c.definition_level + 2, c.repetition_level + 1),
+					false, false, c.definition_level + 1, c.repetition_level
+			).preprocess(|x: Cow<PgVector>| {
+					Cow::<Vec<Option<f32>>>::Owned(x.data.iter().map(|f| Some(*f)).collect())
+			});
+			let wrapped_appender = wrap_pg_row_reader(c, appender);
+			let schema = make_list_schema(name, Repetition::OPTIONAL,
+					ParquetType::primitive_type_builder("element", basic::Type::FLOAT)
+					.with_repetition(Repetition::REQUIRED)
+					.build().unwrap()
+			);
+			(Box::new(wrapped_appender), schema)
+		},
 		"interval" =>
 			match s.interval_handling {
 				SchemaSettingsIntervalHandling::Interval =>
@@ -574,7 +590,7 @@ fn map_simple_type<TRow: PgAbstractRow + Clone + 'static>(
 		// TODO: Regproc Tid Xid Cid PgNodeTree Point Lseg Path Box Polygon Line Cidr Unknown Circle Macaddr8 Aclitem Bpchar Timetz Refcursor Regprocedure Regoper Regoperator Regclass Regtype TxidSnapshot PgLsn PgNdistinct PgDependencies TsVector Tsquery GtsVector Regconfig Regdictionary Jsonpath Regnamespace Regrole Regcollation PgMcvList PgSnapshot Xid9
 
 
-		n => 
+		n =>
 			return Err(format!("Could not map column {}, unsupported primitive type: {}", c.full_name(), n)),
 	})
 }
@@ -659,7 +675,7 @@ fn resolve_primitive_conv<T: for<'a> FromSql<'a> + Clone + 'static, TDataType, F
 		},
 		_ => {}
 	};
-	
+
 	let t = t.with_logical_type(logical_type).build().unwrap();
 
 	let cp =

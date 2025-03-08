@@ -179,5 +179,27 @@ class TestBasic(unittest.TestCase):
         self.assertEqual(tuple(pd_rows[1]), (1, 2, None, None))
         self.assertEqual(tuple(pd_rows[2])[:-1], (2, 3, {'pdbid': None, 'model': None, 'chain': None}))
         self.assertEqual(list(tuple(pd_rows[2])[-1]), [None, {'pdbid': '1ehz', 'model': 1.0, 'chain': 'A'}, {'pdbid': None, 'model': None, 'chain': 'A'}])
+    def test_vector(self):
+        self.maxDiff = None
+        file = wrappers.create_and_export(
+            "custom_vector_type", "id",
+            "id int, v vector(3)",
+            """(1, '[1, 2, 3]'::vector),
+            (2, NULL),
+            (3, '[0.5, -1.5, 2.5]'::vector)
+            """)
+        duckdb_table = duckdb.read_parquet(file).fetchall()
+        self.assertEqual(duckdb_table[0], (1, [1.0, 2.0, 3.0]))
+        self.assertEqual(duckdb_table[1], (2, None))
+        self.assertEqual(duckdb_table[2], (3, [0.5, -1.5, 2.5]))
 
+        pl_df = pl.read_parquet(file)
+        self.assertEqual(pl_df.schema, {
+            "id": pl.Int32,
+            "v": pl.List(pl.Float32)
+        })
+        self.assertEqual(pl_df["id"].to_list(), [1, 2, 3])
+        np.testing.assert_array_almost_equal(pl_df["v"][0], np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        self.assertEqual(pl_df["v"][1], None)
+        np.testing.assert_array_almost_equal(pl_df["v"][2], np.array([0.5, -1.5, 2.5], dtype=np.float32))
 
