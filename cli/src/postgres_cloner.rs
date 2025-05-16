@@ -15,6 +15,7 @@ use parquet::data_type::{DataType, BoolType, Int32Type, Int64Type, FloatType, Do
 use parquet::file::properties::WriterPropertiesPtr;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::format::TimestampType;
+use parquet::file::metadata::KeyValue;
 use pg_bigdecimal::PgNumeric;
 use postgres::error::SqlState;
 use postgres::types::{Kind, Type as PgType, FromSql};
@@ -32,6 +33,7 @@ use crate::datatypes::numeric::{new_decimal_bytes_appender, new_decimal_int_appe
 use crate::myfrom::{MyFrom, self};
 use crate::parquet_writer::{WriterStats, ParquetRowWriter, WriterSettings};
 use crate::pg_custom_types::{PgEnum, PgRawRange, PgAbstractRow, PgRawRecord, PgAny, PgAnyRef, UnclonableHack};
+use crate::datatypes::geometry::PgWkbGeometry;
 
 type ResolvedColumn<TRow> = (DynColumnAppender<TRow>, ParquetType);
 
@@ -222,6 +224,10 @@ pub fn execute_copy(pg_args: &PostgresConnArgs, query: &str, output_file: &PathB
 	}
 	let schema = Arc::new(schema);
 
+	// Add geoParquet metadata if geometry columns are present
+	let output_props = add_geoparquet_metadata(&schema, Arc::try_unwrap(output_props).unwrap());
+	let output_props = Arc::new(output_props);
+
 	let settings = WriterSettings { row_group_byte_limit: 500 * 1024 * 1024, row_group_row_limit: output_props.max_row_group_size() };
 
 	let output_file_f = std::fs::File::create(output_file).unwrap();
@@ -351,8 +357,18 @@ fn map_schema_column<TRow: PgAbstractRow + Clone + 'static>(
 	settings: &SchemaSettings,
 ) -> Result<ResolvedColumn<TRow>, String> {
 	match t.kind() {
-		Kind::Simple =>
-			map_simple_type(t, c, settings),
+		Kind::Simple => {
+			let name = t.name();
+			if let Ok(res) = map_simple_type(t, c, settings) {
+				return Ok(res);
+			}
+			match name {
+				"geometry" => {
+					Ok(resolve_primitive::<PgWkbGeometry, ByteArrayType, _>(c.col_name(), c, None, None))
+				},
+				_ => Err(format!("Could not map column {}, unsupported type: {}", c.full_name(), t)),
+			}
+		},
 		Kind::Enum(ref _enum_data) =>
 			match settings.enum_handling {
 				SchemaSettingsEnumHandling::Int => {
@@ -475,7 +491,7 @@ fn map_schema_column<TRow: PgAbstractRow + Clone + 'static>(
 
 			Ok((Box::new(appender), schema))
 		}
-		_ => Err(format!("Could not map column {}, unsupported type: {}", c.full_name(), t))
+		_ => Err(format!("Could not map column {}, unsupported type: {}", c.full_name(), t)),
 	}
 }
 
@@ -797,6 +813,54 @@ impl ColumnInfo {
 	fn full_name(&self) -> String {
 		self.names.join("/")
 	}
+}
+
+// Utility to add geoParquet metadata to WriterProperties if geometry columns are present
+fn add_geoparquet_metadata(
+    schema: &parquet::schema::types::TypePtr,
+    props: parquet::file::properties::WriterProperties,
+) -> parquet::file::properties::WriterProperties {
+    use parquet::schema::types::Type;
+    use parquet::file::metadata::KeyValue;
+    use serde_json::json;
+
+    let mut geometry_columns = Vec::new();
+    if let Type::GroupType { fields, .. } = schema.as_ref() {
+        for field in fields {
+            let name = field.name();
+            if let Type::PrimitiveType { physical_type, .. } = field.as_ref() {
+                if *physical_type == parquet::basic::Type::BYTE_ARRAY {
+                    // Heuristic: geometry columns are mapped to BYTE_ARRAY and named 'geometry' or similar
+                    if name == "geometry" || name.starts_with("geom") {
+                        geometry_columns.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if geometry_columns.is_empty() {
+        return props;
+    }
+    // Add geo metadata at file level
+    let geo_columns_map = geometry_columns.iter().map(|col| (col.clone(), json!({
+        "encoding": "WKB",
+        "geometry_types": ["Unknown"],
+        "crs": null
+    }))).collect::<serde_json::Map<String, serde_json::Value>>();
+    let geo_file_meta = json!({
+        "version": "0.4.0",
+        "primary_column": geometry_columns[0].clone(),
+        "columns": geo_columns_map
+    });
+    // Copy existing key-value metadata to the new builder
+    let mut key_value_pairs = props.key_value_metadata().cloned().unwrap_or_else(Vec::new);
+    key_value_pairs.push(KeyValue {
+        key: "geo".to_string(),
+        value: Some(geo_file_meta.to_string()),
+    });
+    let mut builder = parquet::file::properties::WriterProperties::builder();
+    builder = builder.set_key_value_metadata(Some(key_value_pairs));
+    builder.build()
 }
 
 
