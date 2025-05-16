@@ -1023,6 +1023,8 @@ dependencies = [
  "postgres-native-tls",
  "postgres-protocol",
  "rpassword",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
