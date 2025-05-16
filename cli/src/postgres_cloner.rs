@@ -213,10 +213,37 @@ fn pg_connect(args: &PostgresConnArgs) -> Result<Client, String> {
 	Ok(client)
 }
 
+fn get_geometry_column_info(client: &mut Client, table: &str) -> std::collections::HashMap<String, (String, Option<i32>)> {
+    let mut info = std::collections::HashMap::new();
+    let sql = format!(
+        "SELECT f_geometry_column, type, srid FROM geometry_columns WHERE f_table_name = '{}'",
+        table
+    );
+    if let Ok(rows) = client.query(&sql, &[]) {
+        for row in rows {
+            let col: String = row.get(0);
+            let typ: String = row.get(1);
+            let srid: i32 = row.get(2);
+            info.insert(col, (typ, Some(srid)));
+        }
+    }
+    info
+}
+
 pub fn execute_copy(pg_args: &PostgresConnArgs, query: &str, output_file: &PathBuf, output_props: WriterPropertiesPtr, quiet: bool, schema_settings: &SchemaSettings) -> Result<WriterStats, String> {
 
 	let mut client = pg_connect(pg_args)?;
 	let statement = client.prepare(query).map_err(|db_err| { db_err.to_string() })?;
+	let table_name: Option<String> = statement.columns().get(0).and_then(|c| c.table_oid()).and_then(|oid| {
+        // Query pg_class to get the table name from oid
+        let row = client.query_opt("SELECT relname FROM pg_class WHERE oid = $1", &[&oid]).ok().flatten();
+        row.map(|r| r.get::<_, String>(0))
+    });
+    let geometry_info = if let Some(ref table) = table_name {
+        get_geometry_column_info(&mut client, table)
+    } else {
+        std::collections::HashMap::new()
+    };
 
 	let (row_appender, schema) = map_schema_root(statement.columns(), schema_settings)?;
 	if !quiet {
@@ -225,7 +252,7 @@ pub fn execute_copy(pg_args: &PostgresConnArgs, query: &str, output_file: &PathB
 	let schema = Arc::new(schema);
 
 	// Add geoParquet metadata if geometry columns are present
-	let output_props = add_geoparquet_metadata(&schema, Arc::try_unwrap(output_props).unwrap());
+	let output_props = add_geoparquet_metadata(&schema, Arc::try_unwrap(output_props).unwrap(), &geometry_info);
 	let output_props = Arc::new(output_props);
 
 	let settings = WriterSettings { row_group_byte_limit: 500 * 1024 * 1024, row_group_row_limit: output_props.max_row_group_size() };
@@ -816,43 +843,40 @@ impl ColumnInfo {
 }
 
 // Utility to add geoParquet metadata to WriterProperties if geometry columns are present
-fn add_geoparquet_metadata(
-    schema: &parquet::schema::types::TypePtr,
-    props: parquet::file::properties::WriterProperties,
-) -> parquet::file::properties::WriterProperties {
-    use parquet::schema::types::Type;
+fn add_geoparquet_metadata(schema: &parquet::schema::types::TypePtr, props: parquet::file::properties::WriterProperties, geometry_info: &std::collections::HashMap<String, (String, Option<i32>)>) -> parquet::file::properties::WriterProperties {
     use parquet::file::metadata::KeyValue;
     use serde_json::json;
-
     let mut geometry_columns = Vec::new();
-    if let Type::GroupType { fields, .. } = schema.as_ref() {
-        for field in fields {
-            let name = field.name();
-            if let Type::PrimitiveType { physical_type, .. } = field.as_ref() {
-                if *physical_type == parquet::basic::Type::BYTE_ARRAY {
-                    // Heuristic: geometry columns are mapped to BYTE_ARRAY and named 'geometry' or similar
-                    if name == "geometry" || name.starts_with("geom") {
-                        geometry_columns.push(name.to_string());
-                    }
-                }
-            }
+    let mut geo_columns_map = serde_json::Map::new();
+    for field in schema.get_fields() {
+        let name = field.name();
+        if let Some((typ, srid)) = geometry_info.get(name) {
+            geometry_columns.push(name);
+            let crs = srid.map(|s| json!({
+                "type": "name",
+                "properties": { "name": format!("EPSG:{}", s) }
+            }));
+            geo_columns_map.insert(
+                name.to_string(),
+                json!({
+                    "encoding": "WKB",
+                    "geometry_types": [typ],
+                    "crs": crs.unwrap_or(serde_json::Value::Null),
+                    "edges": null,
+                    "orientation": null,
+                    "bbox": null
+                })
+            );
         }
     }
     if geometry_columns.is_empty() {
         return props;
     }
-    // Add geo metadata at file level
-    let geo_columns_map = geometry_columns.iter().map(|col| (col.clone(), json!({
-        "encoding": "WKB",
-        "geometry_types": ["Unknown"],
-        "crs": null
-    }))).collect::<serde_json::Map<String, serde_json::Value>>();
     let geo_file_meta = json!({
         "version": "0.4.0",
-        "primary_column": geometry_columns[0].clone(),
+        "primary_column": geometry_columns[0],
         "columns": geo_columns_map
     });
-    // Copy existing key-value metadata to the new builder
     let mut key_value_pairs = props.key_value_metadata().cloned().unwrap_or_else(Vec::new);
     key_value_pairs.push(KeyValue {
         key: "geo".to_string(),
